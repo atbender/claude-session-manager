@@ -1,4 +1,4 @@
-# Claude Session Manager (csm)
+# CSM - Claude Session Manager
 
 A fast TUI for switching between Claude Code sessions in tmux. See all your sessions at a glance with live status detection — know which ones are working, waiting for input, or idle.
 
