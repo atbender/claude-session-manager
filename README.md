@@ -18,7 +18,7 @@ A fast TUI for switching between Claude Code sessions in tmux. See all your sess
 ```bash
 git clone https://github.com/atbender/claude-session-manager.git
 cd claude-session-manager
-make install
+just install
 ```
 
 This installs `csm` to `~/.local/bin`. Make sure this directory is in your PATH.
@@ -65,6 +65,7 @@ Sessions are identified by their tmux pane title prefix (`✳` or Braille spinne
 
 - Go 1.24+
 - tmux (3.2+ for `display-popup` support)
+- [just](https://github.com/casey/just) task runner (`brew install just`)
 - Must be run inside a tmux session
 
 ## License
