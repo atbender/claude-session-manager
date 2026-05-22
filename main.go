@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -50,9 +51,61 @@ func tick() tea.Cmd {
 
 // Detection pipeline
 
-// shellCommands lists processes that indicate Claude has exited.
-var shellCommands = map[string]bool{
-	"zsh": true, "bash": true, "fish": true, "sh": true, "dash": true,
+// procTree maps a parent PID to its child PIDs, plus each PID's comm name.
+// It is used to detect a live `claude` process anywhere in a pane's subtree.
+// This is more reliable than tmux's pane_current_command, which reports only
+// the foreground process-group leader: a Claude launched under a login shell
+// frequently shows up as "zsh" even while it is alive and rendering.
+type procTree struct {
+	children map[int][]int
+	comm     map[int]string
+}
+
+// buildProcTree snapshots all processes once via `ps`.
+// `-eo` is portable across macOS and Linux; comm is the executable basename
+// (truncated to 15 chars on Linux, which still fits "claude").
+func buildProcTree() *procTree {
+	t := &procTree{children: map[int][]int{}, comm: map[int]string{}}
+	out, err := exec.Command("ps", "-eo", "pid=,ppid=,comm=").Output()
+	if err != nil {
+		return t
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		pid, err1 := strconv.Atoi(fields[0])
+		ppid, err2 := strconv.Atoi(fields[1])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		// comm is the basename of the executable; preserve it verbatim.
+		t.comm[pid] = fields[2]
+		t.children[ppid] = append(t.children[ppid], pid)
+	}
+	return t
+}
+
+// hasClaude reports whether pid or any descendant is a `claude` process.
+func (t *procTree) hasClaude(pid int) bool {
+	return t.hasClaudeRec(pid, map[int]bool{})
+}
+
+func (t *procTree) hasClaudeRec(pid int, seen map[int]bool) bool {
+	if seen[pid] {
+		return false // guard against malformed (cyclic) snapshots
+	}
+	seen[pid] = true
+	if t.comm[pid] == "claude" {
+		return true
+	}
+	for _, c := range t.children[pid] {
+		if t.hasClaudeRec(c, seen) {
+			return true
+		}
+	}
+	return false
 }
 
 // isClaudeTitle returns true if the title starts with ✳ or a Braille spinner (U+2800–U+28FF).
@@ -83,12 +136,17 @@ func cleanTitle(title string) string {
 }
 
 func detectSessions() []ClaudeSession {
-	// Step 1: list all panes (includes pane_current_command for liveness check)
+	// Step 1: list all panes. pane_pid roots the per-pane process-tree lookup
+	// used for the liveness check below.
 	out, err := exec.Command("tmux", "list-panes", "-a", "-F",
-		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_path}\t#{pane_title}\t#{pane_current_command}").Output()
+		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}").Output()
 	if err != nil {
 		return nil
 	}
+
+	// Snapshot the process tree once; used to confirm a live claude process
+	// exists in each candidate pane's subtree (see hasClaude).
+	tree := buildProcTree()
 
 	type paneInfo struct {
 		id      string
@@ -108,14 +166,16 @@ func detectSessions() []ClaudeSession {
 			continue
 		}
 		title := parts[2]
-		cmd := parts[3]
 
 		// Check A: title must start with ✳ or Braille spinner
 		if !isClaudeTitle(title) {
 			continue
 		}
-		// Check B: command must not be a shell (indicates Claude has exited)
-		if shellCommands[cmd] {
+		// Check B: a live `claude` process must exist in the pane's subtree.
+		// (pane_current_command is unreliable — it reports the foreground
+		// process-group leader, often "zsh" even while Claude is running.)
+		panePID, err := strconv.Atoi(parts[3])
+		if err != nil || !tree.hasClaude(panePID) {
 			continue
 		}
 
