@@ -49,7 +49,8 @@ Replace `/path/to/csm` with the actual path (e.g. `~/.local/bin/csm` or the `bui
 | `j/k` or `↑/↓` | Navigate sessions |
 | `1-9` | Quick switch to session by number |
 | `Enter` | Switch to selected session |
-| `q` or `Ctrl+C` | Quit |
+| `x` | Kill selected session (asks `y/n` to confirm) |
+| `q`, `Esc` or `Ctrl+C` | Quit |
 
 ## Status Detection
 

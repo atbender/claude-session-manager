@@ -48,6 +48,13 @@ func tick() tea.Cmd {
 	})
 }
 
+// killSession kills a tmux session by name, then rescans.
+func killSession(name string) tea.Cmd {
+	return func() tea.Msg {
+		exec.Command("tmux", "kill-session", "-t", name).Run()
+		return sessionsMsg(detectSessions())
+	}
+}
 
 // Detection pipeline
 
@@ -280,12 +287,14 @@ func shortenPath(path string) string {
 // Bubble Tea model
 
 type model struct {
-	sessions   []ClaudeSession
-	cursor     int
-	width      int
-	height     int
-	quitting   bool
-	selectedID string
+	sessions    []ClaudeSession
+	cursor      int
+	width       int
+	height      int
+	quitting    bool
+	selectedID  string
+	confirmKill bool   // awaiting y/n confirmation for a kill
+	killTarget  string // tmux session name to kill on confirm
 }
 
 func (m model) Init() tea.Cmd {
@@ -324,10 +333,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// While awaiting kill confirmation, capture y/n before anything else
+		// so esc cancels the kill rather than quitting the TUI.
+		if m.confirmKill {
+			switch msg.String() {
+			case "y", "Y":
+				target := m.killTarget
+				m.confirmKill = false
+				m.killTarget = ""
+				return m, killSession(target)
+			default:
+				m.confirmKill = false
+				m.killTarget = ""
+				return m, nil
+			}
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
 			m.quitting = true
 			return m, tea.Quit
+		case "x":
+			if m.cursor < len(m.sessions) {
+				m.confirmKill = true
+				m.killTarget = m.sessions[m.cursor].SessionName
+			}
+			return m, nil
 		case "j", "down":
 			if len(m.sessions) > 0 {
 				m.cursor = (m.cursor + 1) % len(m.sessions)
@@ -439,7 +470,12 @@ func (m model) View() string {
 		}
 	}
 
-	b.WriteString(helpStyle.Render(" ↑↓ navigate · enter switch · q quit"))
+	if m.confirmKill {
+		prompt := fmt.Sprintf(" kill session %q? (y/n)", m.killTarget)
+		b.WriteString(statusStyles[StatusWaiting].MarginTop(1).MarginLeft(2).Render(prompt))
+	} else {
+		b.WriteString(helpStyle.Render(" ↑↓ navigate · enter switch · x kill · q quit"))
+	}
 
 	return b.String()
 }
