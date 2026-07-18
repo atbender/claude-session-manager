@@ -177,6 +177,33 @@ func buildProcTree() *procTree {
 	return t
 }
 
+// procTreeTTL caches the process snapshot between scans. The full-table `ps`
+// is by far the most expensive per-tick call (~40ms, dominating the 1s tick),
+// while liveness changes rarely; a ≤3s-stale answer only means a just-exited
+// session lingers in the list for up to 3 seconds.
+const procTreeTTL = 3 * time.Second
+
+var (
+	procTreeMu sync.Mutex
+	procTreeAt time.Time
+	procTreeV  *procTree
+)
+
+// cachedProcTree returns a recent process snapshot, rebuilding it at most once
+// per procTreeTTL. fresh is true when the snapshot was (re)built on this call —
+// callers seeing a candidate miss on a stale snapshot can retry with force so a
+// just-launched Claude appears immediately instead of after the TTL.
+func cachedProcTree(force bool) (t *procTree, fresh bool) {
+	procTreeMu.Lock()
+	defer procTreeMu.Unlock()
+	if !force && procTreeV != nil && time.Since(procTreeAt) < procTreeTTL {
+		return procTreeV, false
+	}
+	procTreeV = buildProcTree()
+	procTreeAt = time.Now()
+	return procTreeV, true
+}
+
 // hasClaude reports whether pid or any descendant is a `claude` process.
 func (t *procTree) hasClaude(pid int) bool {
 	return t.hasClaudeRec(pid, map[int]bool{})
@@ -251,19 +278,18 @@ func detectSessions() ([]ClaudeSession, map[string]bool) {
 		return nil, livePaths
 	}
 
-	// Snapshot the process tree once; used to confirm a live claude process
-	// exists in each candidate pane's subtree (see hasClaude).
-	tree := buildProcTree()
-
 	type paneInfo struct {
 		id      string
 		sess    string
 		path    string
 		title   string
+		pid     int
 		working bool // title has Braille spinner prefix
 	}
 
-	var candidates []paneInfo
+	// Pass 1: cheap title filter. The process snapshot is only fetched if any
+	// pane looks like Claude, so servers with none pay nothing for `ps`.
+	var titled []paneInfo
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
 			continue
@@ -278,25 +304,48 @@ func detectSessions() ([]ClaudeSession, map[string]bool) {
 		if !isClaudeTitle(title) {
 			continue
 		}
-		// Check B: a live `claude` process must exist in the pane's subtree.
-		// (pane_current_command is unreliable — it reports the foreground
-		// process-group leader, often "zsh" even while Claude is running.)
 		panePID, err := strconv.Atoi(parts[3])
-		if err != nil || !tree.hasClaude(panePID) {
+		if err != nil {
 			continue
 		}
 
 		paneID := parts[0]
 		sessName := strings.SplitN(paneID, ":", 2)[0]
-		candidates = append(candidates, paneInfo{
+		titled = append(titled, paneInfo{
 			id:      paneID,
 			sess:    sessName,
 			path:    parts[1],
 			title:   cleanTitle(title),
+			pid:     panePID,
 			working: isBraillePrefix(title),
 		})
 	}
+	if len(titled) == 0 {
+		return nil, livePaths
+	}
 
+	// Check B: a live `claude` process must exist in the pane's subtree.
+	// (pane_current_command is unreliable — it reports the foreground
+	// process-group leader, often "zsh" even while Claude is running.)
+	tree, fresh := cachedProcTree(false)
+	var candidates, misses []paneInfo
+	for _, p := range titled {
+		if tree.hasClaude(p.pid) {
+			candidates = append(candidates, p)
+		} else {
+			misses = append(misses, p)
+		}
+	}
+	// A miss against a stale snapshot may just be a Claude launched since the
+	// snapshot was taken — retry those once against a fresh one.
+	if len(misses) > 0 && !fresh {
+		tree, _ = cachedProcTree(true)
+		for _, p := range misses {
+			if tree.hasClaude(p.pid) {
+				candidates = append(candidates, p)
+			}
+		}
+	}
 	if len(candidates) == 0 {
 		return nil, livePaths
 	}
