@@ -36,6 +36,12 @@ const (
 // popup stays readable. Older projects remain reachable via search.
 const maxProjects = 25
 
+// narrowWidth is the terminal width below which the compact layout kicks in:
+// status/Resume text and row numbers are dropped (icons stay), the name column
+// is capped, and gutters shrink — so the title/path column survives on small
+// screens (e.g. a phone SSH client at ~43 cols).
+const narrowWidth = 72
+
 // projectRefreshInterval throttles the (relatively expensive) walk of
 // ~/.claude/projects. Live sessions still refresh every tick; only the recent
 // list, which changes slowly, is cached between walks.
@@ -608,6 +614,49 @@ func trimLastRune(s string) string {
 	return s[:len(s)-size]
 }
 
+// truncRight caps s at w runes, ellipsizing the tail. Used for titles, where
+// the start of the text is the informative part.
+func truncRight(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= w {
+		return s
+	}
+	if w == 1 {
+		return "…"
+	}
+	return string(r[:w-1]) + "…"
+}
+
+// truncLeft caps s at w runes, ellipsizing the head. Used for paths, where the
+// trailing components are the informative part.
+func truncLeft(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= w {
+		return s
+	}
+	if w == 1 {
+		return "…"
+	}
+	return "…" + string(r[len(r)-w+1:])
+}
+
+// padRight pads s with spaces to w runes. Rune-aware, unlike fmt's %-*s which
+// counts bytes and misaligns names containing multibyte characters (accents,
+// the truncation ellipsis).
+func padRight(s string, w int) string {
+	d := w - utf8.RuneCountInString(s)
+	if d <= 0 {
+		return s
+	}
+	return s + strings.Repeat(" ", d)
+}
+
 // Bubble Tea model
 
 type model struct {
@@ -984,7 +1033,12 @@ func (m model) View() string {
 	b.WriteString("\n")
 
 	if m.filtering {
-		b.WriteString(filterStyle.Render("/ " + m.filter + "▊"))
+		q := m.filter
+		if m.width > 0 {
+			// Keep the tail visible — that's where the user is typing.
+			q = truncLeft(q, max(1, m.width-6))
+		}
+		b.WriteString(filterStyle.Render("/ " + q + "▊"))
 		b.WriteString("\n")
 	}
 
@@ -999,19 +1053,33 @@ func (m model) View() string {
 		b.WriteString("\n")
 	}
 
-	// Column widths, computed over the visible rows.
-	maxSess, maxName := 0, 0
+	// Name-column width, unified across sections so rows align. On narrow
+	// terminals it is capped so the title/path column keeps usable space.
+	nameW := 0
 	for _, r := range rows {
-		switch r.kind {
-		case rowSession:
-			if len(r.sess.SessionName) > maxSess {
-				maxSess = len(r.sess.SessionName)
-			}
-		case rowProject:
-			if len(r.proj.Name) > maxName {
-				maxName = len(r.proj.Name)
-			}
+		n := r.sess.SessionName
+		if r.kind == rowProject {
+			n = r.proj.Name
 		}
+		if c := utf8.RuneCountInString(n); c > nameW {
+			nameW = c
+		}
+	}
+	narrow := m.width > 0 && m.width < narrowWidth
+	if narrow && nameW > 16 {
+		nameW = 16
+	}
+
+	// descWidth is the room left for the trailing title/path, given the rune
+	// width of everything before it on the line.
+	descWidth := func(prefix int) int {
+		if m.width <= 0 {
+			return 1 << 20 // width unknown (before the first WindowSizeMsg)
+		}
+		if w := m.width - prefix - 1; w > 0 {
+			return w
+		}
+		return 0
 	}
 
 	start, end := m.window(rows)
@@ -1029,29 +1097,52 @@ func (m model) View() string {
 		if i == m.cursor {
 			pointer = " ▸"
 		}
-		// Only the first 9 rows are reachable by number key, and not while the
-		// filter is capturing digits — so only label those.
-		num := " "
-		if !m.filtering && i < 9 {
-			num = strconv.Itoa(i + 1)
+
+		name := r.sess.SessionName
+		if r.kind == rowProject {
+			name = r.proj.Name
 		}
+		name = padRight(truncRight(name, nameW), nameW)
 
 		var line string
-		if r.kind == rowSession {
-			s := r.sess
-			style := statusStyles[s.Status]
-			sym := style.Render(statusSymbol(s.Status))
-			label := style.Render(fmt.Sprintf("%-7s", statusLabel(s.Status)))
-			sess := fmt.Sprintf("%-*s", maxSess, s.SessionName)
-			title := dimTitleStyle.Render(s.Title)
-			line = fmt.Sprintf(" %s %s  %s %s   %s  %s", pointer, num, sym, label, sess, title)
+		if narrow {
+			// Compact: no number, no status/Resume text — the colored icon
+			// carries the state, and the reclaimed columns go to the title.
+			// Prefix: " " + pointer(2) + " " + icon(1) + " " + name + " ".
+			descW := descWidth(7 + nameW)
+			if r.kind == rowSession {
+				s := r.sess
+				sym := statusStyles[s.Status].Render(statusSymbol(s.Status))
+				title := dimTitleStyle.Render(truncRight(s.Title, descW))
+				line = fmt.Sprintf(" %s %s %s %s", pointer, sym, name, title)
+			} else {
+				sym := projStyle.Render("↻")
+				path := dimTitleStyle.Render(truncLeft(r.proj.Display, descW))
+				line = fmt.Sprintf(" %s %s %s %s", pointer, sym, name, path)
+			}
 		} else {
-			p := r.proj
-			sym := projStyle.Render("↻")
-			label := projStyle.Render(fmt.Sprintf("%-7s", "Resume"))
-			name := fmt.Sprintf("%-*s", maxName, p.Name)
-			path := dimTitleStyle.Render(p.Display)
-			line = fmt.Sprintf(" %s %s  %s %s   %s  %s", pointer, num, sym, label, name, path)
+			// Only the first 9 rows are reachable by number key, and not while
+			// the filter is capturing digits — so only label those.
+			num := " "
+			if !m.filtering && i < 9 {
+				num = strconv.Itoa(i + 1)
+			}
+			// Prefix: " "+ptr(2)+" "+num(1)+"  "+icon(1)+" "+label(7)+"   "+name+"  ".
+			descW := descWidth(21 + nameW)
+			if r.kind == rowSession {
+				s := r.sess
+				style := statusStyles[s.Status]
+				sym := style.Render(statusSymbol(s.Status))
+				label := style.Render(fmt.Sprintf("%-7s", statusLabel(s.Status)))
+				title := dimTitleStyle.Render(truncRight(s.Title, descW))
+				line = fmt.Sprintf(" %s %s  %s %s   %s  %s", pointer, num, sym, label, name, title)
+			} else {
+				p := r.proj
+				sym := projStyle.Render("↻")
+				label := projStyle.Render(fmt.Sprintf("%-7s", "Resume"))
+				path := dimTitleStyle.Render(truncLeft(p.Display, descW))
+				line = fmt.Sprintf(" %s %s  %s %s   %s  %s", pointer, num, sym, label, name, path)
+			}
 		}
 
 		if i == m.cursor {
@@ -1072,20 +1163,43 @@ func (m model) View() string {
 		if m.openResume {
 			verb = "resume Claude in"
 		}
-		prompt := fmt.Sprintf(" %s %s? (y/n)", verb, m.openDisplay)
+		if narrow {
+			verb = "new session in"
+			if m.openResume {
+				verb = "resume in"
+			}
+		}
+		disp := m.openDisplay
+		if m.width > 0 {
+			// Keep the folder tail and the trailing "? (y/n)" visible.
+			disp = truncLeft(disp, max(8, m.width-utf8.RuneCountInString(verb)-12))
+		}
+		prompt := fmt.Sprintf(" %s %s? (y/n)", verb, disp)
 		b.WriteString(projStyle.MarginTop(1).MarginLeft(2).Render(prompt))
 	case m.notice != "":
 		b.WriteString(noticeStyle.Render(" " + m.notice))
 	case m.filtering:
 		help := " type to filter · ↑↓ select · enter switch/resume · ^o new · esc clear"
+		if narrow {
+			help = " type · ↑↓ · ⏎ open · ^o new · esc"
+		}
 		if scrolled {
 			help += fmt.Sprintf("   %d/%d", m.cursor+1, len(rows))
+		}
+		if m.width > 0 {
+			help = truncRight(help, max(1, m.width-3))
 		}
 		b.WriteString(helpStyle.Render(help))
 	default:
 		help := " ↑↓ navigate · enter switch/resume · n new · / search · x kill · q quit"
+		if narrow {
+			help = " ↑↓ · ⏎ open · n new · / find · q"
+		}
 		if scrolled {
 			help += fmt.Sprintf("   %d/%d", m.cursor+1, len(rows))
+		}
+		if m.width > 0 {
+			help = truncRight(help, max(1, m.width-3))
 		}
 		b.WriteString(helpStyle.Render(help))
 	}
