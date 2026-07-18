@@ -628,6 +628,7 @@ type model struct {
 	openTarget  string // folder to open on confirm
 	openDisplay string // ~-shortened folder, shown in the confirm prompt
 	openResume  bool   // spawn with --continue (resume) vs a fresh conversation
+	notice      string // transient message shown until the next keypress
 }
 
 // visibleRows builds the ordered, filtered list the cursor indexes into:
@@ -727,6 +728,26 @@ func (m model) activate(rows []row, i int) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// armNewSession requests confirmation to spawn a *fresh* Claude session in the
+// highlighted row's folder (a live session's cwd or a project's path). Bound to
+// both `n` (normal mode) and Ctrl+O — the latter also works in search mode,
+// where letter keys are captured by the query. Emits a notice if the row has no
+// resolvable folder, so the key press is never a silent no-op.
+func (m *model) armNewSession(rows []row) {
+	if m.cursor < 0 || m.cursor >= len(rows) {
+		return
+	}
+	dir, disp, ok := rowFolder(rows[m.cursor])
+	if !ok {
+		m.notice = "no folder to open for this row"
+		return
+	}
+	m.confirmOpen = true
+	m.openResume = false
+	m.openTarget = dir
+	m.openDisplay = disp
+}
+
 func (m model) Init() tea.Cmd {
 	return tea.Batch(scan(), tick())
 }
@@ -750,6 +771,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// A transient notice lives until the next keypress.
+		m.notice = ""
+
 		// While awaiting kill confirmation, capture y/n before anything else
 		// so esc cancels the kill rather than quitting the TUI.
 		if m.confirmKill {
@@ -811,6 +835,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case tea.KeyDown, tea.KeyCtrlN:
 				m.moveCursor(m.visibleRows(), 1)
 				return m, nil
+			case tea.KeyCtrlO:
+				// New fresh session in the highlighted folder — reachable while
+				// searching, where `n` would be typed into the query instead.
+				m.armNewSession(m.visibleRows())
+				return m, nil
 			case tea.KeySpace:
 				m.filter += " "
 				m.cursor = 0
@@ -840,18 +869,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.killTarget = rows[m.cursor].sess.SessionName
 			}
 			return m, nil
-		case "n":
+		case "n", "ctrl+o":
 			// New session: spawn a *fresh* Claude in the highlighted row's
 			// folder. Works on a live session too, giving a second session for
 			// an already-open project (a fresh conversation, not the live one).
-			if m.cursor < len(rows) {
-				if dir, disp, ok := rowFolder(rows[m.cursor]); ok {
-					m.confirmOpen = true
-					m.openResume = false
-					m.openTarget = dir
-					m.openDisplay = disp
-				}
-			}
+			m.armNewSession(rows)
 			return m, nil
 		case "j", "down":
 			m.moveCursor(rows, 1)
@@ -876,7 +898,8 @@ var (
 	selectedRow   = lipgloss.NewStyle().Background(lipgloss.Color("236"))
 	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
 	dimTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	projStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("111")) // soft blue
+	projStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("111"))                            // soft blue
+	noticeStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).MarginTop(1).MarginLeft(2) // amber
 	helpStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("242")).MarginTop(1).MarginLeft(2)
 
 	statusStyles = map[int]lipgloss.Style{
@@ -1051,8 +1074,10 @@ func (m model) View() string {
 		}
 		prompt := fmt.Sprintf(" %s %s? (y/n)", verb, m.openDisplay)
 		b.WriteString(projStyle.MarginTop(1).MarginLeft(2).Render(prompt))
+	case m.notice != "":
+		b.WriteString(noticeStyle.Render(" " + m.notice))
 	case m.filtering:
-		help := " type to filter · ↑↓ select · enter open · esc clear"
+		help := " type to filter · ↑↓ select · enter switch/resume · ^o new · esc clear"
 		if scrolled {
 			help += fmt.Sprintf("   %d/%d", m.cursor+1, len(rows))
 		}
