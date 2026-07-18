@@ -45,7 +45,8 @@ type ClaudeSession struct {
 	PaneID      string
 	SessionName string
 	Title       string
-	Path        string
+	Path        string // ~-shortened cwd, for display
+	Dir         string // raw cwd, for spawning a new session in the same folder
 	Status      int
 }
 
@@ -79,6 +80,18 @@ func rowKey(r row) string {
 		return "s:" + r.sess.PaneID
 	}
 	return "p:" + r.proj.Path
+}
+
+// rowFolder returns the folder a row points at (a live session's cwd or a
+// project's path) and its display form, for spawning a new session there.
+func rowFolder(r row) (dir, display string, ok bool) {
+	if r.kind == rowSession {
+		if r.sess.Dir == "" {
+			return "", "", false
+		}
+		return r.sess.Dir, r.sess.Path, true
+	}
+	return r.proj.Path, r.proj.Display, true
 }
 
 // scanResult bundles a single scan of live sessions plus closed projects.
@@ -312,6 +325,7 @@ func detectSessions() ([]ClaudeSession, map[string]bool) {
 				SessionName: p.sess,
 				Title:       p.title,
 				Path:        shortenPath(p.path),
+				Dir:         p.path,
 				Status:      status,
 			}
 			valid[idx] = true
@@ -545,13 +559,18 @@ func shortenPath(path string) string {
 	return path
 }
 
-// openInFolder spawns a detached tmux session in dir resuming the most recent
-// Claude conversation there, then switches the client to it. The new-session
-// error is checked so a name collision doesn't switch the client into an
-// unrelated existing session.
-func openInFolder(dir string) {
+// openInFolder spawns a detached tmux session in dir, then switches the client
+// to it. When resume is true it continues the folder's most recent conversation
+// (`claude --continue`); otherwise it starts a fresh one — which is what you
+// want when opening a second session for a folder that already has one live.
+// The new-session error is checked so a name collision doesn't switch the
+// client into an unrelated existing session.
+func openInFolder(dir string, resume bool) {
 	name := sessionNameFor(dir)
-	cmd := "claude --continue --dangerously-skip-permissions"
+	cmd := "claude --dangerously-skip-permissions"
+	if resume {
+		cmd = "claude --continue --dangerously-skip-permissions"
+	}
 	if err := exec.Command("tmux", "new-session", "-d", "-s", name, "-c", dir, cmd).Run(); err != nil {
 		return
 	}
@@ -608,6 +627,7 @@ type model struct {
 	confirmOpen bool   // awaiting y/n confirmation to spawn a session
 	openTarget  string // folder to open on confirm
 	openDisplay string // ~-shortened folder, shown in the confirm prompt
+	openResume  bool   // spawn with --continue (resume) vs a fresh conversation
 }
 
 // visibleRows builds the ordered, filtered list the cursor indexes into:
@@ -701,6 +721,7 @@ func (m model) activate(rows []row, i int) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	m.confirmOpen = true
+	m.openResume = true
 	m.openTarget = r.proj.Path
 	m.openDisplay = r.proj.Display
 	return m, nil
@@ -758,6 +779,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.confirmOpen = false
 				m.openTarget = ""
 				m.openDisplay = ""
+				m.openResume = false
 				return m, nil
 			}
 		}
@@ -816,6 +838,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < len(rows) && rows[m.cursor].kind == rowSession {
 				m.confirmKill = true
 				m.killTarget = rows[m.cursor].sess.SessionName
+			}
+			return m, nil
+		case "n":
+			// New session: spawn a *fresh* Claude in the highlighted row's
+			// folder. Works on a live session too, giving a second session for
+			// an already-open project (a fresh conversation, not the live one).
+			if m.cursor < len(rows) {
+				if dir, disp, ok := rowFolder(rows[m.cursor]); ok {
+					m.confirmOpen = true
+					m.openResume = false
+					m.openTarget = dir
+					m.openDisplay = disp
+				}
 			}
 			return m, nil
 		case "j", "down":
@@ -1010,7 +1045,11 @@ func (m model) View() string {
 		prompt := fmt.Sprintf(" kill session %q? (y/n)", m.killTarget)
 		b.WriteString(statusStyles[StatusWaiting].MarginTop(1).MarginLeft(2).Render(prompt))
 	case m.confirmOpen:
-		prompt := fmt.Sprintf(" open a new Claude session in %s? (y/n)", m.openDisplay)
+		verb := "open a new Claude session in"
+		if m.openResume {
+			verb = "resume Claude in"
+		}
+		prompt := fmt.Sprintf(" %s %s? (y/n)", verb, m.openDisplay)
 		b.WriteString(projStyle.MarginTop(1).MarginLeft(2).Render(prompt))
 	case m.filtering:
 		help := " type to filter · ↑↓ select · enter open · esc clear"
@@ -1019,7 +1058,7 @@ func (m model) View() string {
 		}
 		b.WriteString(helpStyle.Render(help))
 	default:
-		help := " ↑↓ navigate · enter switch/open · / search · x kill · q quit"
+		help := " ↑↓ navigate · enter switch/resume · n new · / search · x kill · q quit"
 		if scrolled {
 			help += fmt.Sprintf("   %d/%d", m.cursor+1, len(rows))
 		}
@@ -1049,6 +1088,6 @@ func main() {
 	case actionSwitch:
 		exec.Command("tmux", "switch-client", "-t", final.selectedID).Run()
 	case actionOpen:
-		openInFolder(final.openPath)
+		openInFolder(final.openPath, final.openResume)
 	}
 }
