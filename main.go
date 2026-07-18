@@ -565,6 +565,22 @@ func shortenPath(path string) string {
 	return path
 }
 
+// claudeCmd builds the shell command a spawned session runs. Extra arguments
+// come from the CSM_CLAUDE_ARGS environment variable (e.g. set it to
+// "--dangerously-skip-permissions" to skip permission prompts) so the default
+// stays safe. Note the popup inherits the tmux *server's* environment, so set
+// it via `set-environment -g` in tmux.conf rather than a shell profile.
+func claudeCmd(resume bool) string {
+	cmd := "claude"
+	if resume {
+		cmd += " --continue"
+	}
+	if extra := strings.TrimSpace(os.Getenv("CSM_CLAUDE_ARGS")); extra != "" {
+		cmd += " " + extra
+	}
+	return cmd
+}
+
 // openInFolder spawns a detached tmux session in dir, then switches the client
 // to it. When resume is true it continues the folder's most recent conversation
 // (`claude --continue`); otherwise it starts a fresh one — which is what you
@@ -573,11 +589,7 @@ func shortenPath(path string) string {
 // client into an unrelated existing session.
 func openInFolder(dir string, resume bool) {
 	name := sessionNameFor(dir)
-	cmd := "claude --dangerously-skip-permissions"
-	if resume {
-		cmd = "claude --continue --dangerously-skip-permissions"
-	}
-	if err := exec.Command("tmux", "new-session", "-d", "-s", name, "-c", dir, cmd).Run(); err != nil {
+	if err := exec.Command("tmux", "new-session", "-d", "-s", name, "-c", dir, claudeCmd(resume)).Run(); err != nil {
 		return
 	}
 	exec.Command("tmux", "switch-client", "-t", name).Run()
