@@ -1,4 +1,5 @@
 build/
+/claude-session-manager
 insights.md
 .claude/
 .DS_Store
