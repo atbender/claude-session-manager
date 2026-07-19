@@ -125,10 +125,13 @@ func tick() tea.Cmd {
 	})
 }
 
-// killSession kills a tmux session by name, then rescans.
-func killSession(name string) tea.Cmd {
+// killSession kills a tmux session by its stable id, then rescans. Targeting
+// the id (not the name) is exact: tmux name matching falls back to prefix/fnmatch
+// when the exact name is gone, so a stale name captured before the session
+// exited could otherwise kill a different, similarly-named session.
+func killSession(sessionID string) tea.Cmd {
 	return func() tea.Msg {
-		exec.Command("tmux", "kill-session", "-t", name).Run()
+		exec.Command("tmux", "kill-session", "-t", sessionID).Run()
 		return scanResultMsg(scanAll())
 	}
 }
@@ -617,10 +620,15 @@ func determineStatus(content string) int {
 
 func shortenPath(path string) string {
 	home, err := os.UserHomeDir()
-	if err != nil {
+	if err != nil || home == "" {
 		return path
 	}
-	if strings.HasPrefix(path, home) {
+	if path == home {
+		return "~"
+	}
+	// Require a separator boundary so a sibling like /Users/xBackup isn't
+	// rewritten as ~Backup.
+	if strings.HasPrefix(path, home+string(os.PathSeparator)) {
 		return "~" + path[len(home):]
 	}
 	return path
@@ -684,10 +692,18 @@ func switchToSession(s ClaudeSession) {
 // client into an unrelated existing session.
 func openInFolder(dir string, resume bool) {
 	name := sessionNameFor(dir)
-	if err := exec.Command("tmux", "new-session", "-d", "-s", name, "-c", dir, claudeCmd(resume)).Run(); err != nil {
+	// -P -F prints the new session's stable id, so the switch targets it exactly
+	// (a name target could prefix/fnmatch-resolve to a different session).
+	out, err := exec.Command("tmux", "new-session", "-d", "-P", "-F", "#{session_id}",
+		"-s", name, "-c", dir, claudeCmd(resume)).Output()
+	if err != nil {
 		return
 	}
-	switchClient(name)
+	target := strings.TrimSpace(string(out))
+	if target == "" {
+		target = name
+	}
+	switchClient(target)
 }
 
 // sessionNameFor derives a unique, tmux-safe session name from a folder path.
@@ -779,7 +795,8 @@ type model struct {
 	filtering   bool          // search input is active
 	filter      string        // current search query
 	confirmKill bool          // awaiting y/n confirmation for a kill
-	killTarget  string        // tmux session name to kill on confirm
+	killID      string        // stable tmux session id to kill on confirm
+	killName    string        // session name, shown in the confirm prompt
 	confirmOpen bool          // awaiting y/n confirmation to spawn a session
 	openTarget  string        // folder to open on confirm
 	openDisplay string        // ~-shortened folder, shown in the confirm prompt
@@ -935,13 +952,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.confirmKill {
 			switch msg.String() {
 			case "y", "Y":
-				target := m.killTarget
+				id := m.killID
 				m.confirmKill = false
-				m.killTarget = ""
-				return m, killSession(target)
+				m.killID = ""
+				m.killName = ""
+				return m, killSession(id)
 			default:
 				m.confirmKill = false
-				m.killTarget = ""
+				m.killID = ""
+				m.killName = ""
 				return m, nil
 			}
 		}
@@ -1022,7 +1041,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Kill only applies to live sessions, not closed projects.
 			if m.cursor < len(rows) && rows[m.cursor].kind == rowSession {
 				m.confirmKill = true
-				m.killTarget = rows[m.cursor].sess.SessionName
+				m.killID = rows[m.cursor].sess.SessionID
+				m.killName = rows[m.cursor].sess.SessionName
 			}
 			return m, nil
 		case "n", "ctrl+o":
@@ -1263,7 +1283,7 @@ func (m model) View() string {
 
 	switch {
 	case m.confirmKill:
-		prompt := fmt.Sprintf(" kill session %q? (y/n)", m.killTarget)
+		prompt := fmt.Sprintf(" kill session %q? (y/n)", m.killName)
 		b.WriteString(statusStyles[StatusWaiting].MarginTop(1).MarginLeft(2).Render(prompt))
 	case m.confirmOpen:
 		verb := "open a new Claude session in"
