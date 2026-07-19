@@ -42,10 +42,12 @@ Add to your `~/.tmux.conf` for quick access:
 
 ```tmux
 # Popup overlay (tmux 3.2+)
-bind C-o display-popup -E -w 100% -h 100% "/path/to/csm"
+bind C-o run-shell "tmux display-popup -c '#{client_name}' -E -w 100% -h 100% -e CSM_TMUX_CLIENT='#{client_name}' /path/to/csm"
 ```
 
 Replace `/path/to/csm` with the actual path (e.g. `~/.local/bin/csm` or the `build/csm` path).
+
+The `run-shell` wrapper and `CSM_TMUX_CLIENT` matter when you have **more than one tmux client attached** (e.g. an editor that opens each session in its own terminal): they tell csm which client to switch, so selecting a session moves *your* view rather than yanking a random other client to it. `#{client_name}` does not expand inside a `display-popup` command directly, which is why it's wrapped in `run-shell`. A plain `display-popup -E "/path/to/csm"` still works fine if you only ever attach one client.
 
 ### Extra arguments for spawned sessions
 

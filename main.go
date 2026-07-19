@@ -48,8 +48,10 @@ const narrowWidth = 72
 const projectRefreshInterval = 3 * time.Second
 
 type ClaudeSession struct {
-	PaneID      string
-	SessionName string
+	SessionName string // display + kill target
+	SessionID   string // stable tmux id ($N), switch target
+	WindowID    string // stable tmux id (@N)
+	PaneID      string // stable tmux id (%N), switch target + row key
 	Title       string
 	Path        string // ~-shortened cwd, for display
 	Dir         string // raw cwd, for spawning a new session in the same folder
@@ -270,17 +272,20 @@ func canonPath(p string) string {
 func detectSessions() ([]ClaudeSession, map[string]bool) {
 	livePaths := map[string]bool{}
 
-	// Step 1: list all panes. pane_pid roots the per-pane process-tree lookup
-	// used for the liveness check below.
+	// Step 1: list all panes. Stable ids (session/window/pane) are captured so
+	// switching targets an exact pane, never a reused positional index; pane_pid
+	// roots the per-pane process-tree lookup used for the liveness check below.
 	out, err := exec.Command("tmux", "list-panes", "-a", "-F",
-		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}").Output()
+		"#{session_name}\t#{session_id}\t#{window_id}\t#{pane_id}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}").Output()
 	if err != nil {
 		return nil, livePaths
 	}
 
 	type paneInfo struct {
-		id      string
 		sess    string
+		sessID  string
+		winID   string
+		paneID  string
 		path    string
 		title   string
 		pid     int
@@ -294,27 +299,27 @@ func detectSessions() ([]ClaudeSession, map[string]bool) {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 4)
-		if len(parts) < 4 {
+		parts := strings.SplitN(line, "\t", 7)
+		if len(parts) < 7 {
 			continue
 		}
-		title := parts[2]
+		title := parts[5]
 
 		// Check A: title must start with ✳ or Braille spinner
 		if !isClaudeTitle(title) {
 			continue
 		}
-		panePID, err := strconv.Atoi(parts[3])
+		panePID, err := strconv.Atoi(parts[6])
 		if err != nil {
 			continue
 		}
 
-		paneID := parts[0]
-		sessName := strings.SplitN(paneID, ":", 2)[0]
 		titled = append(titled, paneInfo{
-			id:      paneID,
-			sess:    sessName,
-			path:    parts[1],
+			sess:    parts[0],
+			sessID:  parts[1],
+			winID:   parts[2],
+			paneID:  parts[3],
+			path:    parts[4],
 			title:   cleanTitle(title),
 			pid:     panePID,
 			working: isBraillePrefix(title),
@@ -367,7 +372,7 @@ func detectSessions() ([]ClaudeSession, map[string]bool) {
 				status = StatusWorking
 			} else {
 				// ✳ prefix — capture pane to distinguish Waiting vs Idle
-				out, err := exec.Command("tmux", "capture-pane", "-t", p.id, "-p", "-S", "-50").Output()
+				out, err := exec.Command("tmux", "capture-pane", "-t", p.paneID, "-p", "-S", "-50").Output()
 				if err != nil {
 					return
 				}
@@ -376,8 +381,10 @@ func detectSessions() ([]ClaudeSession, map[string]bool) {
 			}
 
 			results[idx] = ClaudeSession{
-				PaneID:      p.id,
 				SessionName: p.sess,
+				SessionID:   p.sessID,
+				WindowID:    p.winID,
+				PaneID:      p.paneID,
 				Title:       p.title,
 				Path:        shortenPath(p.path),
 				Dir:         p.path,
@@ -399,7 +406,12 @@ func detectSessions() ([]ClaudeSession, map[string]bool) {
 		}
 	}
 
+	// Sort by session name (stable, human-grouped); pane id breaks ties within
+	// a session. (Sorting by the raw %N id would order by creation, not name.)
 	sort.Slice(sessions, func(i, j int) bool {
+		if sessions[i].SessionName != sessions[j].SessionName {
+			return sessions[i].SessionName < sessions[j].SessionName
+		}
 		return sessions[i].PaneID < sessions[j].PaneID
 	})
 
@@ -630,6 +642,40 @@ func claudeCmd(resume bool) string {
 	return cmd
 }
 
+// switchClient switches to target, targeting the *invoking* client when the tmux
+// keybinding passed it via CSM_TMUX_CLIENT. Without -c, `switch-client` acts on
+// tmux's notion of the current client, which is unreliable once the popup has
+// closed — with several clients attached (e.g. one VS Code terminal per session)
+// it can yank a random other client to the target, replacing what it was showing.
+func switchClient(target string) {
+	exec.Command("tmux", switchClientArgs(target)...).Run()
+}
+
+// switchClientArgs builds the switch-client argv, adding -c <client> when the
+// binding provided CSM_TMUX_CLIENT. Split out so the targeting logic is testable
+// without spawning tmux.
+func switchClientArgs(target string) []string {
+	args := []string{"switch-client"}
+	if c := strings.TrimSpace(os.Getenv("CSM_TMUX_CLIENT")); c != "" {
+		args = append(args, "-c", c)
+	}
+	return append(args, "-t", target)
+}
+
+// switchToSession points the invoking client at a live session and lands on the
+// exact window/pane by stable id, so a reused positional index can never select
+// the wrong pane. (For the single-pane sessions csm spawns, the window/pane
+// selects are no-ops, but they make switching correct for any session.)
+func switchToSession(s ClaudeSession) {
+	switchClient(s.SessionID)
+	if s.WindowID != "" {
+		exec.Command("tmux", "select-window", "-t", s.WindowID).Run()
+	}
+	if s.PaneID != "" {
+		exec.Command("tmux", "select-pane", "-t", s.PaneID).Run()
+	}
+}
+
 // openInFolder spawns a detached tmux session in dir, then switches the client
 // to it. When resume is true it continues the folder's most recent conversation
 // (`claude --continue`); otherwise it starts a fresh one — which is what you
@@ -641,7 +687,7 @@ func openInFolder(dir string, resume bool) {
 	if err := exec.Command("tmux", "new-session", "-d", "-s", name, "-c", dir, claudeCmd(resume)).Run(); err != nil {
 		return
 	}
-	exec.Command("tmux", "switch-client", "-t", name).Run()
+	switchClient(name)
 }
 
 // sessionNameFor derives a unique, tmux-safe session name from a folder path.
@@ -728,17 +774,17 @@ type model struct {
 	height      int
 	quitting    bool
 	action      int
-	selectedID  string // pane id for actionSwitch
-	openPath    string // folder for actionOpen
-	filtering   bool   // search input is active
-	filter      string // current search query
-	confirmKill bool   // awaiting y/n confirmation for a kill
-	killTarget  string // tmux session name to kill on confirm
-	confirmOpen bool   // awaiting y/n confirmation to spawn a session
-	openTarget  string // folder to open on confirm
-	openDisplay string // ~-shortened folder, shown in the confirm prompt
-	openResume  bool   // spawn with --continue (resume) vs a fresh conversation
-	notice      string // transient message shown until the next keypress
+	selected    ClaudeSession // live session to switch to, for actionSwitch
+	openPath    string        // folder for actionOpen
+	filtering   bool          // search input is active
+	filter      string        // current search query
+	confirmKill bool          // awaiting y/n confirmation for a kill
+	killTarget  string        // tmux session name to kill on confirm
+	confirmOpen bool          // awaiting y/n confirmation to spawn a session
+	openTarget  string        // folder to open on confirm
+	openDisplay string        // ~-shortened folder, shown in the confirm prompt
+	openResume  bool          // spawn with --continue (resume) vs a fresh conversation
+	notice      string        // transient message shown until the next keypress
 }
 
 // visibleRows builds the ordered, filtered list the cursor indexes into:
@@ -828,7 +874,7 @@ func (m model) activate(rows []row, i int) (tea.Model, tea.Cmd) {
 	if r.kind == rowSession {
 		m.quitting = true
 		m.action = actionSwitch
-		m.selectedID = r.sess.PaneID
+		m.selected = r.sess
 		return m, tea.Quit
 	}
 	m.confirmOpen = true
@@ -1286,7 +1332,7 @@ func main() {
 	}
 	switch final.action {
 	case actionSwitch:
-		exec.Command("tmux", "switch-client", "-t", final.selectedID).Run()
+		switchToSession(final.selected)
 	case actionOpen:
 		openInFolder(final.openPath, final.openResume)
 	}
