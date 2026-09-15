@@ -17,6 +17,9 @@ build:
 install: build
     @echo "Installing {{binary}} to {{install_dir}}..."
     @mkdir -p {{install_dir}}
+    @# rm first: on Apple Silicon, cp over an existing binary invalidates the
+    @# kernel's cached code signature and the new binary dies with SIGKILL.
+    @rm -f {{install_dir}}/{{binary}}
     @cp {{build_dir}}/{{binary}} {{install_dir}}/{{binary}}
     @echo "Installed! Make sure {{install_dir}} is in your PATH"
 
